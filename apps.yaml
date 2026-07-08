@@ -1,0 +1,33 @@
+apps:
+  - id: authport-web
+    name: Authport Web
+    url: http://localhost:3001
+    origins:
+      - http://localhost:3001
+    # Public identifier the browser app sends as x-app-key. Safe to ship in
+    # client code; only trusted alongside one of the origins above.
+    clientId: authport-web
+    # Secret credentials for server-to-server calls. Keep these out of browsers.
+    secretKeys:
+      - dev-authport-web-secret-change-me
+    # Enabled social logins. Credentials come from env, e.g. google ->
+    # AUTHPORT_WEB_GOOGLE_CLIENT_ID / AUTHPORT_WEB_GOOGLE_CLIENT_SECRET.
+    # socialProviders:
+    #   - google
+    #   - github
+    # Enterprise SSO: external OIDC IdPs to delegate to. providerId + discoveryUrl
+    # here; credentials in env, e.g. AUTHPORT_WEB_OIDC_OKTA_CLIENT_ID / _SECRET.
+    # oidcProviders:
+    #   - providerId: okta
+    #     discoveryUrl: https://your-tenant.okta.com/.well-known/openid-configuration
+    #     scopes: [openid, email, profile]
+    # Enterprise SSO via SAML. providerId must be globally unique. IdP signing cert
+    # in env (AUTHPORT_WEB_SAML_ACME_OKTA_IDP_CERT); optional SP key in
+    # AUTHPORT_WEB_SAML_ACME_OKTA_SP_PRIVATE_KEY. Give the IdP this ACS URL:
+    #   ${BETTER_AUTH_URL}/api/auth/sso/saml2/sp/acs/<providerId>
+    # samlProviders:
+    #   - providerId: acme-okta
+    #     domain: acme.com
+    #     issuer: https://acme.okta.com/exk...        # IdP entityID
+    #     entryPoint: https://acme.okta.com/app/abc/sso/saml   # IdP SSO URL
+    #     wantAssertionsSigned: true

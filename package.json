@@ -1,0 +1,26 @@
+{
+  "name": "authport",
+  "module": "src/server.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun --watch src/server.ts",
+    "start": "bun src/server.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "auth:migrate": "bun src/migrate.ts"
+  },
+  "devDependencies": {
+    "@better-auth/cli": "^1.4.21",
+    "@types/bun": "latest",
+    "@types/pg": "^8.20.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@better-auth/sso": "^1.6.23",
+    "better-auth": "^1.6.23",
+    "effect": "^3.21.4",
+    "kysely": "^0.29.3",
+    "pg": "^8.22.0"
+  }
+}

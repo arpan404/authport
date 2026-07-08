@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AuthPort example consumer</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
+      button { display: block; width: 100%; padding: 0.6rem; margin: 0.4rem 0; cursor: pointer; }
+      input { width: 100%; padding: 0.5rem; box-sizing: border-box; }
+      pre { background: #f4f4f5; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+    </style>
+  </head>
+  <body>
+    <h1>AuthPort example consumer</h1>
+    <p>App key <code>authport-web</code> → AuthPort at <code>http://localhost:3000</code>.</p>
+
+    <input id="email" type="email" placeholder="you@acme.com" />
+    <button id="sso-email">Sign in with SSO (by email domain)</button>
+    <button id="sso-provider">Sign in with SSO (provider: acme-okta)</button>
+    <button id="google">Sign in with Google</button>
+    <button id="signout">Sign out</button>
+
+    <h2>Session</h2>
+    <pre id="session">…</pre>
+
+    <script type="module" src="./app.ts"></script>
+  </body>
+</html>
