@@ -1,8 +1,18 @@
 # AuthPort
 
+[![CI](https://github.com/arpan404/authport/actions/workflows/ci.yml/badge.svg)](https://github.com/arpan404/authport/actions/workflows/ci.yml)
+
 Centralized, self-hosted [Better Auth](https://better-auth.com) service for multiple
 apps. Bun + TypeScript, written in [Effect](https://effect.website) (typed error
 channels, `Config`, `Layer` services, scoped resources), backed by Postgres.
+
+## Requirements
+
+- [Bun](https://bun.sh) 1.3.14
+- PostgreSQL
+- Redis (optional; recommended for multiple server instances)
+
+## Quick start
 
 ```sh
 bun install
