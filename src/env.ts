@@ -11,6 +11,17 @@ export type EnvValues = {
   readonly maxRequestBodySize: number;
   readonly isProd: boolean;
   readonly redisUrl: Option.Option<Redacted.Redacted<string>>;
+  readonly notifications:
+    | { readonly mode: "console" }
+    | {
+        readonly mode: "providers";
+        readonly cloudflareAccountId: string;
+        readonly cloudflareApiToken: Redacted.Redacted<string>;
+        readonly twilioAccountSid: string;
+        readonly twilioApiKey: string;
+        readonly twilioApiSecret: Redacted.Redacted<string>;
+        readonly twilioFrom: string;
+      };
   /** Headers to resolve the real client IP behind a trusted proxy (rate limiting). */
   readonly ipAddressHeaders: Option.Option<string[]>;
 };
@@ -40,6 +51,35 @@ const load = Effect.gen(function* () {
     Config.map((value) => value === "production"),
   );
   const redisUrl = yield* Config.option(Config.redacted("REDIS_URL"));
+  const notificationDelivery = yield* Config.string("NOTIFICATION_DELIVERY").pipe(
+    Config.withDefault(isProd ? "providers" : "console"),
+  );
+  if (notificationDelivery !== "console" && notificationDelivery !== "providers") {
+    yield* Effect.fail(
+      new InsecureConfigError({
+        message: "NOTIFICATION_DELIVERY must be console or providers",
+      }),
+    );
+  }
+  if (isProd && notificationDelivery === "console") {
+    yield* Effect.fail(
+      new InsecureConfigError({
+        message: "NOTIFICATION_DELIVERY=console is not allowed in production",
+      }),
+    );
+  }
+  const notifications =
+    notificationDelivery === "console"
+      ? ({ mode: "console" } as const)
+      : ({
+          mode: "providers",
+          cloudflareAccountId: yield* Config.string("CLOUDFLARE_ACCOUNT_ID"),
+          cloudflareApiToken: yield* Config.redacted("CLOUDFLARE_EMAIL_API_TOKEN"),
+          twilioAccountSid: yield* Config.string("TWILIO_ACCOUNT_SID"),
+          twilioApiKey: yield* Config.string("TWILIO_API_KEY"),
+          twilioApiSecret: yield* Config.redacted("TWILIO_API_SECRET"),
+          twilioFrom: yield* Config.string("TWILIO_FROM"),
+        } as const);
   const ipAddressHeaders = yield* Config.option(
     Config.string("IP_ADDRESS_HEADERS"),
   ).pipe(
@@ -135,6 +175,7 @@ const load = Effect.gen(function* () {
     maxRequestBodySize,
     isProd,
     redisUrl,
+    notifications,
     ipAddressHeaders,
   } satisfies EnvValues;
 });

@@ -38,6 +38,8 @@ export type App = {
   clientId?: string;
   /** Secret, server-to-server credentials. May be plaintext or `sha256:<hex>` at rest. */
   secretKeys: string[];
+  /** Verified sender address used for this app's transactional email. */
+  emailFrom?: string;
   /** Opt-in shared parent domain for cross-subdomain cookies (e.g. ".example.com").
    * Only set for apps that trust their subdomain siblings; otherwise cookies stay
    * host-only on the auth origin and never reach sibling apps. */
@@ -68,6 +70,7 @@ const RawAppSchema = Schema.Struct({
   origins: Schema.optional(Schema.Array(Schema.String)),
   clientId: Schema.optional(Schema.String),
   secretKeys: Schema.optional(Schema.Array(Schema.String)),
+  emailFrom: Schema.optional(Schema.String),
   cookieDomain: Schema.optional(Schema.String),
   socialProviders: Schema.optional(Schema.Array(Schema.String)),
   oidcProviders: Schema.optional(
@@ -339,6 +342,10 @@ const normalizeApp = (app: RawApp, index: number) =>
 
     const name = app.name?.trim();
     const clientId = app.clientId?.trim();
+    const emailFrom = app.emailFrom?.trim();
+    if (emailFrom && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailFrom)) {
+      yield* fail(`apps[${index}].emailFrom must be a valid email address`);
+    }
     const cookieDomain = app.cookieDomain?.trim();
     if (
       cookieDomain &&
@@ -495,6 +502,7 @@ const normalizeApp = (app: RawApp, index: number) =>
       url,
       origins: uniq([urlOrigin, ...extraOrigins]),
       ...(clientId ? { clientId } : {}),
+      ...(emailFrom ? { emailFrom } : {}),
       ...(cookieDomain ? { cookieDomain } : {}),
       secretKeys,
       schema,

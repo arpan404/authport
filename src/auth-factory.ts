@@ -7,6 +7,7 @@ import type { App } from "./apps";
 import { acquirePool, createDb } from "./db";
 import type { EnvValues } from "./env";
 import { InsecureConfigError, ProviderCredentialsError } from "./errors";
+import { makeNotifier } from "./notifications";
 import { namespaceStorage, type SecondaryStorageApi } from "./redis";
 
 /** One statically-provisioned SSO provider entry for the `sso` plugin. */
@@ -166,6 +167,15 @@ export const buildAuthOptions = (
     const social = yield* buildSocialProviders(app);
     const oidc = yield* buildOidcProviders(app);
     const saml = yield* buildSamlProviders(app, env.authUrl);
+    const notifier = yield* Effect.try({
+      try: () => makeNotifier(app, env),
+      catch: (cause) =>
+        cause instanceof InsecureConfigError
+          ? cause
+          : new InsecureConfigError({
+              message: `notification setup failed for app "${app.id}"`,
+            }),
+    });
 
     const cookieDomain = app.cookieDomain;
     if (cookieDomain) {
@@ -195,7 +205,22 @@ export const buildAuthOptions = (
       secret: Redacted.value(env.secret),
       database: { db: createDb(pool), type: "postgres" },
       trustedOrigins: app.origins,
-      emailAndPassword: { enabled: true },
+      emailAndPassword: {
+        enabled: true,
+        requireEmailVerification: true,
+        revokeSessionsOnPasswordReset: true,
+        sendResetPassword: async ({ user, url }) => {
+          notifier.link(user.email, "Reset your password", url);
+        },
+      },
+      emailVerification: {
+        sendOnSignUp: true,
+        sendOnSignIn: true,
+        sendVerificationEmail: async ({ user, url }) => {
+          notifier.link(user.email, "Verify your email", url);
+        },
+      },
+      user: { changeEmail: { enabled: true } },
       // Cross-provider account linking is OFF unless the app explicitly lists
       // trusted providers. When enabled, linking still requires a matching email
       // (`allowDifferentEmails: false`), so a trusted provider can only link to an

@@ -5,6 +5,7 @@ import { Env } from "./env";
 /** The shape Better Auth expects for `secondaryStorage`. */
 export type SecondaryStorageApi = {
   get: (key: string) => Promise<string | null>;
+  getAndDelete: (key: string) => Promise<string | null>;
   set: (key: string, value: string, ttl?: number) => Promise<void>;
   delete: (key: string) => Promise<void>;
   /** Atomic increment used by Better Auth's distributed rate limiter. */
@@ -28,6 +29,7 @@ export const namespaceStorage = (
   const key = (value: string) => `${namespace}:${value}`;
   return {
     get: (value) => storage.get(key(value)),
+    getAndDelete: (value) => storage.getAndDelete(key(value)),
     set: (value, data, ttl) => storage.set(key(value), data, ttl),
     delete: (value) => storage.delete(key(value)),
     increment: (value, ttl) => storage.increment(key(value), ttl),
@@ -60,6 +62,8 @@ const make = Effect.gen(function* () {
 
   const api: SecondaryStorageApi = {
     get: (key) => Effect.runPromise(Effect.promise(() => client.get(key))),
+    getAndDelete: (key) =>
+      Effect.runPromise(Effect.promise(() => client.send("GETDEL", [key]))),
     set: (key, value, ttl) =>
       Effect.runPromise(
         Effect.promise(() =>

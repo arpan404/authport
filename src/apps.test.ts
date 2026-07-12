@@ -101,6 +101,20 @@ apps:
     expect(derived.apps[0]?.schema).toBe("app_authport_web");
   });
 
+  test("validates an app transactional sender", () => {
+    const result = Effect.runSync(
+      parseAppsConfig(`
+apps:
+  - id: web
+    url: http://localhost:3001
+    clientId: c
+    emailFrom: not-an-email
+`).pipe(Effect.either),
+    );
+
+    expect(result._tag).toBe("Left");
+  });
+
   test("rejects app ids that normalize ambiguously", () => {
     const result = Effect.runSync(
       parseAppsConfig(`
