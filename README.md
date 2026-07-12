@@ -213,4 +213,4 @@ examples/consumer    Minimal browser client
 
 ## License
 
-[MIT](LICENSE) © 2026 Arpan Bhandari
+[MIT](LICENSE) © 2026 arpan404
