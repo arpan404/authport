@@ -3,6 +3,7 @@ import { Effect, Option } from "effect";
 import {
   appForRequest,
   appForSamlCallback,
+  appForSamlMetadata,
   corsHeadersFor,
   parseAppsConfig,
   type AppsConfig,
@@ -89,15 +90,28 @@ describe("app allowlist", () => {
     expect(appForRequest(request, config)).toEqual(Option.none());
   });
 
-  test("derives an isolated Postgres schema from the app id", () => {
+  test("derives an isolated Postgres schema from a canonical app id", () => {
     const derived = load(`
 apps:
-  - id: Authport-Web
+  - id: authport-web
     url: http://localhost:3001
     clientId: c
 `);
 
     expect(derived.apps[0]?.schema).toBe("app_authport_web");
+  });
+
+  test("rejects app ids that normalize ambiguously", () => {
+    const result = Effect.runSync(
+      parseAppsConfig(`
+apps:
+  - id: authport--web
+    url: http://localhost:3001
+    clientId: c
+`).pipe(Effect.either),
+    );
+
+    expect(result._tag).toBe("Left");
   });
 
   test("parses enterprise OIDC providers", () => {
@@ -160,6 +174,42 @@ apps:
     );
   });
 
+  test("does not treat a social callback as a SAML callback", () => {
+    const derived = load(`
+apps:
+  - id: web
+    url: http://localhost:3001
+    clientId: c
+    samlProviders:
+      - providerId: google
+        domain: acme.com
+        issuer: https://acme.example/issuer
+        entryPoint: https://acme.example/sso
+`);
+    const callback = new Request("http://auth.local/api/auth/callback/google");
+    expect(appForSamlCallback(callback, derived)).toEqual(Option.none());
+  });
+
+  test("routes public SAML metadata by providerId", () => {
+    const derived = load(`
+apps:
+  - id: web
+    url: http://localhost:3001
+    clientId: c
+    samlProviders:
+      - providerId: acme
+        domain: acme.com
+        issuer: https://acme.example/issuer
+        entryPoint: https://acme.example/sso
+`);
+    const request = new Request(
+      "http://auth.local/api/auth/sso/saml2/sp/metadata?providerId=acme",
+    );
+    expect(Option.map(appForSamlMetadata(request, derived), (a) => a.id)).toEqual(
+      Option.some("web"),
+    );
+  });
+
   test("rejects SAML providerIds that collide across apps", () => {
     const result = Effect.runSync(
       parseAppsConfig(`
@@ -186,6 +236,36 @@ apps:
     expect(result._tag).toBe("Left");
   });
 
+  test("accepts trusted link providers that reference a configured provider", () => {
+    const derived = load(`
+apps:
+  - id: web
+    url: http://localhost:3001
+    clientId: c
+    socialProviders: [google]
+    accountLinking:
+      trustedProviders: [google]
+`);
+
+    expect(derived.apps[0]?.trustedLinkProviders).toEqual(["google"]);
+  });
+
+  test("rejects a trusted link provider that is not configured on the app", () => {
+    const result = Effect.runSync(
+      parseAppsConfig(`
+apps:
+  - id: web
+    url: http://localhost:3001
+    clientId: c
+    socialProviders: [google]
+    accountLinking:
+      trustedProviders: [github]
+`).pipe(Effect.either),
+    );
+
+    expect(result._tag).toBe("Left");
+  });
+
   test("rejects duplicate app ids", () => {
     const result = Effect.runSync(
       parseAppsConfig(`
@@ -196,6 +276,39 @@ apps:
   - id: web
     url: http://localhost:3002
     clientId: b
+`).pipe(Effect.either),
+    );
+
+    expect(result._tag).toBe("Left");
+  });
+
+  test("rejects shared server secrets across apps", () => {
+    const result = Effect.runSync(
+      parseAppsConfig(`
+apps:
+  - id: a
+    url: http://localhost:3001
+    secretKeys: [shared]
+  - id: b
+    url: http://localhost:3002
+    secretKeys: [shared]
+`).pipe(Effect.either),
+    );
+
+    expect(result._tag).toBe("Left");
+  });
+
+  test("rejects a provider id shared across provider types", () => {
+    const result = Effect.runSync(
+      parseAppsConfig(`
+apps:
+  - id: web
+    url: http://localhost:3001
+    clientId: c
+    socialProviders: [google]
+    oidcProviders:
+      - providerId: google
+        discoveryUrl: https://accounts.example/.well-known/openid-configuration
 `).pipe(Effect.either),
     );
 

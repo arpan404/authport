@@ -1,9 +1,12 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { Array as Arr, Config, Effect, Option, Schema } from "effect";
 import { socialProviderList } from "better-auth/social-providers";
 import { AppsConfigError } from "./errors";
 
 const knownSocialProviders = new Set<string>(socialProviderList);
+const reservedProviderIds = new Set(["credential"]);
+const appIdPattern = /^(?=.{1,48}$)[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const providerIdPattern = /^(?=.{1,64}$)[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 /** An external OIDC identity provider (Okta, Azure AD, Google Workspace, …). */
 export type OidcProvider = {
@@ -24,7 +27,6 @@ export type SamlProvider = {
   entryPoint: string;
   audience?: string;
   identifierFormat?: string;
-  wantAssertionsSigned?: boolean;
 };
 
 export type App = {
@@ -34,8 +36,12 @@ export type App = {
   origins: string[];
   /** Public, browser-facing identifier. Only trusted together with a matching Origin. */
   clientId?: string;
-  /** Secret, server-to-server credentials. Never expose these to a browser. */
+  /** Secret, server-to-server credentials. May be plaintext or `sha256:<hex>` at rest. */
   secretKeys: string[];
+  /** Opt-in shared parent domain for cross-subdomain cookies (e.g. ".example.com").
+   * Only set for apps that trust their subdomain siblings; otherwise cookies stay
+   * host-only on the auth origin and never reach sibling apps. */
+  cookieDomain?: string;
   /** Postgres schema holding this app's isolated user pool. Derived from `id`. */
   schema: string;
   /** Enabled social providers (e.g. "google", "github"); credentials come from env. */
@@ -44,6 +50,10 @@ export type App = {
   oidcProviders: OidcProvider[];
   /** Enterprise SSO: external SAML IdPs this app delegates to; cert/keys from env. */
   samlProviders: SamlProvider[];
+  /** Providers whose verified email may link into an existing account. Empty means
+   * no cross-provider linking (the safe default). Only list providers you trust not
+   * to assert emails their users don't own. */
+  trustedLinkProviders: string[];
 };
 
 export type AppsConfig = {
@@ -58,6 +68,7 @@ const RawAppSchema = Schema.Struct({
   origins: Schema.optional(Schema.Array(Schema.String)),
   clientId: Schema.optional(Schema.String),
   secretKeys: Schema.optional(Schema.Array(Schema.String)),
+  cookieDomain: Schema.optional(Schema.String),
   socialProviders: Schema.optional(Schema.Array(Schema.String)),
   oidcProviders: Schema.optional(
     Schema.Array(
@@ -77,9 +88,13 @@ const RawAppSchema = Schema.Struct({
         entryPoint: Schema.String,
         audience: Schema.optional(Schema.String),
         identifierFormat: Schema.optional(Schema.String),
-        wantAssertionsSigned: Schema.optional(Schema.Boolean),
       }),
     ),
+  ),
+  accountLinking: Schema.optional(
+    Schema.Struct({
+      trustedProviders: Schema.optional(Schema.Array(Schema.String)),
+    }),
   ),
 });
 
@@ -105,6 +120,21 @@ const safeOrigin = (value: string | null | undefined): Option.Option<string> => 
   }
 };
 
+const isSecureProviderUrl = (value: string) => {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" ||
+      (url.protocol === "http:" &&
+        (url.hostname === "localhost" ||
+          url.hostname === "127.0.0.1" ||
+          url.hostname === "[::1]"))
+    );
+  } catch {
+    return false;
+  }
+};
+
 /** Origin of a browser request. Uses only the `Origin` header (never `Referer`)
  * so it matches the notion of origin used for CORS. */
 export const requestOrigin = (request: Request): Option.Option<string> =>
@@ -118,11 +148,23 @@ const safeEqual = (a: string, b: string) => {
   return timingSafeEqual(aBuf, bBuf);
 };
 
-/** Scans every secret without short-circuiting to avoid a timing side channel. */
+const sha256Hex = (value: string) =>
+  createHash("sha256").update(value).digest("hex");
+
+/**
+ * Matches a presented key against an app's secret keys in constant time, without
+ * short-circuiting. A stored key may be plaintext or `sha256:<hex>` — the latter
+ * lets apps.yaml hold only hashes at rest, so a config leak doesn't expose keys.
+ */
 const matchesSecretKey = (app: App, key: string) => {
+  const keyHash = sha256Hex(key);
   let matched = false;
   for (const secret of app.secretKeys) {
-    if (safeEqual(secret, key)) matched = true;
+    if (secret.startsWith("sha256:")) {
+      if (safeEqual(secret.slice("sha256:".length), keyHash)) matched = true;
+    } else if (safeEqual(secret, key)) {
+      matched = true;
+    }
   }
   return matched;
 };
@@ -131,6 +173,12 @@ const matchesSecretKey = (app: App, key: string) => {
  * Resolves the app authorized to make this request via the `x-app-key` header.
  * A public `clientId` is only trusted alongside a known `Origin` (browser flow);
  * a secret key is trusted on its own (server-to-server flow).
+ *
+ * NOTE: this is multi-tenant *routing* plus a CORS/allowlist gate, NOT app
+ * authentication. `clientId` is public and the `Origin` check only constrains
+ * real browsers; a non-browser caller can present a known clientId + Origin. The
+ * actual security boundary is Better Auth (credentials, sessions, CSRF) — the
+ * per-app auth endpoints are meant to be publicly reachable.
  */
 export const appForRequest = (
   request: Request,
@@ -188,7 +236,29 @@ export const appForSamlCallback = (
   request: Request,
   config: AppsConfig,
 ): Option.Option<App> => {
-  const providerId = new URL(request.url).pathname.split("/").filter(Boolean).pop();
+  const match = new URL(request.url).pathname.match(
+    /^\/api\/auth\/sso\/saml2\/(?:callback|sp\/(?:acs|slo)|logout)\/([^/]+)\/?$/,
+  );
+  const providerId = match?.[1];
+  if (!providerId) return Option.none();
+  return Arr.findFirst(config.apps, (app) =>
+    app.samlProviders.some((provider) => provider.providerId === providerId),
+  );
+};
+
+/** Routes the public SAML SP metadata endpoint by its required providerId query. */
+export const appForSamlMetadata = (
+  request: Request,
+  config: AppsConfig,
+): Option.Option<App> => {
+  const url = new URL(request.url);
+  if (
+    request.method !== "GET" ||
+    url.pathname !== "/api/auth/sso/saml2/sp/metadata"
+  ) {
+    return Option.none();
+  }
+  const providerId = url.searchParams.get("providerId");
   if (!providerId) return Option.none();
   return Arr.findFirst(config.apps, (app) =>
     app.samlProviders.some((provider) => provider.providerId === providerId),
@@ -237,15 +307,27 @@ const toSchemaName = (id: string) => {
 };
 
 const originEffect = (value: string, field: string) =>
-  Option.match(safeOrigin(value), {
-    onNone: () => fail(`${field} must be a valid URL`),
-    onSome: (origin) => Effect.succeed(origin),
+  Effect.gen(function* () {
+    const origin = yield* Option.match(safeOrigin(value), {
+      onNone: () => fail(`${field} must be a valid URL`),
+      onSome: Effect.succeed,
+    });
+    const protocol = new URL(value).protocol;
+    if (protocol !== "http:" && protocol !== "https:") {
+      yield* fail(`${field} must use http or https`);
+    }
+    return origin;
   });
 
 const normalizeApp = (app: RawApp, index: number) =>
   Effect.gen(function* () {
     const id = app.id.trim();
     if (!id) yield* fail(`apps[${index}].id is required`);
+    if (!appIdPattern.test(id)) {
+      yield* fail(
+        `apps[${index}].id must be 1-48 lowercase letters, digits, or hyphens`,
+      );
+    }
 
     const url = app.url.trim();
     if (!url) yield* fail(`apps[${index}].url is required`);
@@ -257,9 +339,23 @@ const normalizeApp = (app: RawApp, index: number) =>
 
     const name = app.name?.trim();
     const clientId = app.clientId?.trim();
+    const cookieDomain = app.cookieDomain?.trim();
+    if (
+      cookieDomain &&
+      !/^\.?[a-z0-9](?:[a-z0-9.-]*[a-z0-9])$/i.test(cookieDomain)
+    ) {
+      yield* fail(`apps[${index}].cookieDomain is not a valid domain`);
+    }
     const secretKeys = (app.secretKeys ?? [])
       .map((key) => key.trim())
       .filter(Boolean);
+    for (const key of secretKeys) {
+      if (key.startsWith("sha256:") && !/^sha256:[a-f0-9]{64}$/.test(key)) {
+        yield* fail(
+          `apps[${index}].secretKeys contains an invalid sha256 digest`,
+        );
+      }
+    }
 
     if (!clientId && secretKeys.length === 0) {
       yield* fail(`apps[${index}] must define a clientId, secretKeys, or both`);
@@ -285,10 +381,20 @@ const normalizeApp = (app: RawApp, index: number) =>
           if (!providerId) {
             yield* fail(`apps[${index}].oidcProviders[${i}].providerId is required`);
           }
-          const discoveryUrl = provider.discoveryUrl.trim();
-          if (Option.isNone(safeOrigin(discoveryUrl))) {
+          if (!providerIdPattern.test(providerId)) {
             yield* fail(
-              `apps[${index}].oidcProviders[${i}].discoveryUrl must be a valid URL`,
+              `apps[${index}].oidcProviders[${i}].providerId must be 1-64 lowercase letters, digits, or hyphens`,
+            );
+          }
+          if (reservedProviderIds.has(providerId)) {
+            yield* fail(
+              `apps[${index}].oidcProviders[${i}].providerId is reserved`,
+            );
+          }
+          const discoveryUrl = provider.discoveryUrl.trim();
+          if (!isSecureProviderUrl(discoveryUrl)) {
+            yield* fail(
+              `apps[${index}].oidcProviders[${i}].discoveryUrl must use https (or loopback http)`,
             );
           }
           const scopes = provider.scopes ? [...provider.scopes] : undefined;
@@ -312,18 +418,30 @@ const normalizeApp = (app: RawApp, index: number) =>
           if (!providerId) {
             yield* fail(`apps[${index}].samlProviders[${i}].providerId is required`);
           }
+          if (!providerIdPattern.test(providerId)) {
+            yield* fail(
+              `apps[${index}].samlProviders[${i}].providerId must be 1-64 lowercase letters, digits, or hyphens`,
+            );
+          }
+          if (reservedProviderIds.has(providerId)) {
+            yield* fail(
+              `apps[${index}].samlProviders[${i}].providerId is reserved`,
+            );
+          }
           const domain = provider.domain.trim();
-          if (!domain) {
-            yield* fail(`apps[${index}].samlProviders[${i}].domain is required`);
+          if (!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])$/i.test(domain)) {
+            yield* fail(
+              `apps[${index}].samlProviders[${i}].domain must be a valid email domain`,
+            );
           }
           const issuer = provider.issuer.trim();
           if (!issuer) {
             yield* fail(`apps[${index}].samlProviders[${i}].issuer is required`);
           }
           const entryPoint = provider.entryPoint.trim();
-          if (Option.isNone(safeOrigin(entryPoint))) {
+          if (!isSecureProviderUrl(entryPoint)) {
             yield* fail(
-              `apps[${index}].samlProviders[${i}].entryPoint must be a valid URL`,
+              `apps[${index}].samlProviders[${i}].entryPoint must use https (or loopback http)`,
             );
           }
           const audience = provider.audience?.trim();
@@ -335,9 +453,6 @@ const normalizeApp = (app: RawApp, index: number) =>
             entryPoint,
             ...(audience ? { audience } : {}),
             ...(identifierFormat ? { identifierFormat } : {}),
-            ...(provider.wantAssertionsSigned !== undefined
-              ? { wantAssertionsSigned: provider.wantAssertionsSigned }
-              : {}),
           } satisfies SamlProvider;
         }),
     );
@@ -346,17 +461,47 @@ const normalizeApp = (app: RawApp, index: number) =>
       yield* fail(`apps[${index}].samlProviders has duplicate providerId`);
     }
 
+    // Trusted-link providers must reference a provider actually configured on this
+    // app (a typo here would silently trust nothing or the wrong provider).
+    const configuredProviderIds = new Set<string>([
+      ...socialProviders,
+      ...oidcProviders.map((provider) => provider.providerId),
+      ...samlProviders.map((provider) => provider.providerId),
+    ]);
+    const providerCount =
+      socialProviders.length + oidcProviders.length + samlProviders.length;
+    if (configuredProviderIds.size !== providerCount) {
+      yield* fail(
+        `apps[${index}] has a providerId collision across social, OIDC, or SAML providers`,
+      );
+    }
+    const trustedLinkProviders = uniq(
+      (app.accountLinking?.trustedProviders ?? [])
+        .map((provider) => provider.trim())
+        .filter(Boolean),
+    );
+    for (const provider of trustedLinkProviders) {
+      if (!configuredProviderIds.has(provider)) {
+        yield* fail(
+          `apps[${index}].accountLinking.trustedProviders references "${provider}", ` +
+            `which is not a configured social/oidc/saml provider on this app`,
+        );
+      }
+    }
+
     return {
       id,
       ...(name ? { name } : {}),
       url,
       origins: uniq([urlOrigin, ...extraOrigins]),
       ...(clientId ? { clientId } : {}),
+      ...(cookieDomain ? { cookieDomain } : {}),
       secretKeys,
       schema,
       socialProviders,
       oidcProviders,
       samlProviders,
+      trustedLinkProviders,
     } satisfies App;
   });
 
@@ -380,6 +525,43 @@ export const parseAppsConfig = (
     const ids = apps.map((app) => app.id);
     if (new Set(ids).size !== ids.length) {
       yield* fail("apps.yaml contains duplicate app ids");
+    }
+
+    const schemas = apps.map((app) => app.schema);
+    if (new Set(schemas).size !== schemas.length) {
+      yield* fail("apps.yaml contains app ids that resolve to the same schema");
+    }
+
+    const routeKeys = new Set<string>();
+    const secretOwners = new Map<string, string>();
+    const publicKeyHashes = new Set(
+      apps.flatMap((app) => (app.clientId ? [sha256Hex(app.clientId)] : [])),
+    );
+    for (const app of apps) {
+      if (app.clientId) {
+        for (const origin of app.origins) {
+          const routeKey = `${origin}\0${app.clientId}`;
+          if (routeKeys.has(routeKey)) {
+            yield* fail(
+              `clientId "${app.clientId}" is ambiguous for origin "${origin}"`,
+            );
+          }
+          routeKeys.add(routeKey);
+        }
+      }
+      for (const secret of app.secretKeys) {
+        const digest = secret.startsWith("sha256:")
+          ? secret.slice("sha256:".length)
+          : sha256Hex(secret);
+        const owner = secretOwners.get(digest);
+        if (owner) {
+          yield* fail(`apps "${owner}" and "${app.id}" share a secret key`);
+        }
+        if (publicKeyHashes.has(digest)) {
+          yield* fail(`app "${app.id}" has a secret key that is also a clientId`);
+        }
+        secretOwners.set(digest, app.id);
+      }
     }
 
     // SAML ACS callbacks carry no app key or cookie, so they are routed by the

@@ -3,6 +3,7 @@ import {
   appForCookies,
   appForRequest,
   appForSamlCallback,
+  appForSamlMetadata,
   corsHeadersFor,
   type App,
   type AppsConfig as AppsConfigValue,
@@ -23,6 +24,20 @@ const withCors = (response: Response, cors: Headers) => {
 
 const text = (body: string, status: number, headers?: Headers) =>
   new Response(body, headers ? { status, headers } : { status });
+
+/** Adds baseline response hardening. HSTS belongs at the TLS edge. */
+const withSecurityHeaders = (response: Response) => {
+  const headers = new Headers(response.headers);
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("x-frame-options", "DENY");
+  headers.set("referrer-policy", "no-referrer");
+  headers.set("cross-origin-opener-policy", "same-origin");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+};
 
 /** Runs the resolved app's isolated Better Auth handler, recovering to a 500. */
 const runAuth = (authApp: AuthApp, request: Request) =>
@@ -52,6 +67,9 @@ const isProviderCallback = (pathname: string) =>
   pathname.startsWith("/api/auth/sso/saml2/sp/slo/") ||
   pathname.startsWith("/api/auth/sso/saml2/logout/");
 
+const isSamlMetadata = (pathname: string) =>
+  pathname === "/api/auth/sso/saml2/sp/metadata";
+
 const resolveAuthApp = (app: App) =>
   Effect.gen(function* () {
     const registry = yield* AuthRegistry;
@@ -67,6 +85,7 @@ const resolveAuthApp = (app: App) =>
 const handleProviderCallback = (request: Request, config: AppsConfigValue) =>
   Effect.gen(function* () {
     const app: Option.Option<App> = appForSamlCallback(request, config).pipe(
+      Option.orElse(() => appForSamlMetadata(request, config)),
       Option.orElse(() => appForCookies(request, config)),
     );
     if (Option.isNone(app)) return text("Forbidden", 403);
@@ -101,18 +120,35 @@ const handleRequest = (request: Request) =>
     if (url.pathname === "/health") {
       return Response.json({ ok: true });
     }
+    if (url.pathname === "/ready") {
+      const registry = yield* AuthRegistry;
+      const ready = yield* Effect.tryPromise({
+        try: registry.checkReadiness,
+        catch: () => undefined,
+      }).pipe(
+        Effect.timeout("3 seconds"),
+        Effect.as(true),
+        Effect.catchAll(() => Effect.succeed(false)),
+      );
+      return ready
+        ? Response.json({ ok: true })
+        : Response.json({ ok: false }, { status: 503 });
+    }
     if (url.pathname !== "/api/auth" && !url.pathname.startsWith("/api/auth/")) {
       return text("Not Found", 404);
     }
 
     const config = yield* AppsConfig;
-    return yield* isProviderCallback(url.pathname)
+    return yield* (isProviderCallback(url.pathname) || isSamlMetadata(url.pathname))
       ? handleProviderCallback(request, config)
       : handleApiRequest(request, config);
   }).pipe(
-    // Any unexpected typed failure (e.g. UnknownAppError) becomes a logged 500.
+    // Any unexpected typed failure (e.g. UnknownAppError) becomes a 500. Log only
+    // the tag + safe message — never the raw error, which can carry tokens/PII.
     Effect.catchAll((error) =>
-      Effect.logError(error).pipe(Effect.as(text("Internal Server Error", 500))),
+      Effect.logError(`${error._tag}: ${error.message}`).pipe(
+        Effect.as(text("Internal Server Error", 500)),
+      ),
     ),
   );
 
@@ -124,23 +160,51 @@ const boot = Effect.gen(function* () {
   const env = yield* Env;
   const { apps } = yield* AppsConfig;
   yield* AuthRegistry;
-  return { port: env.port, appIds: apps.map((app) => app.id) };
+  return {
+    port: env.port,
+    maxRequestBodySize: env.maxRequestBodySize,
+    appIds: apps.map((app) => app.id),
+  };
 });
 
 runtime
   .runPromise(boot)
-  .then(({ port, appIds }) => {
+  .then(({ port, maxRequestBodySize, appIds }) => {
     const server = Bun.serve({
       port,
-      fetch: (request) => runtime.runPromise(handleRequest(request)),
+      maxRequestBodySize,
+      fetch: (request) =>
+        runtime
+          .runPromise(handleRequest(request))
+          .then(withSecurityHeaders)
+          .catch(() => withSecurityHeaders(text("Internal Server Error", 500))),
     });
     runtime.runSync(
       Effect.log(
         `Auth service listening on ${server.url} for apps: ${appIds.join(", ")}`,
       ),
     );
+
+    let stopping = false;
+    const shutdown = async (signal: string) => {
+      if (stopping) return;
+      stopping = true;
+      runtime.runSync(Effect.log(`Received ${signal}; draining requests`));
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const drained = await Promise.race([
+        server.stop(false).then(() => true),
+        new Promise<false>((resolve) => {
+          timeout = setTimeout(() => resolve(false), 10_000);
+        }),
+      ]);
+      if (timeout) clearTimeout(timeout);
+      if (!drained) await server.stop(true);
+      await runtime.dispose();
+    };
+    process.once("SIGTERM", () => void shutdown("SIGTERM"));
+    process.once("SIGINT", () => void shutdown("SIGINT"));
   })
   .catch((error) => {
-    runtime.runSync(Effect.logError(error));
+    runtime.runSync(Effect.logError(error instanceof Error ? error.message : String(error)));
     process.exit(1);
   });

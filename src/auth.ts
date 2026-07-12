@@ -11,6 +11,7 @@ type AuthInstance = ReturnType<typeof betterAuth>;
 export type AuthApp = {
   app: App;
   auth: AuthInstance;
+  checkDatabase: () => Promise<void>;
 };
 
 /** The parsed apps.yaml, available as a service. */
@@ -29,7 +30,10 @@ export const AppsConfigLive = Layer.effect(AppsConfig, loadAppsConfig);
  */
 export class AuthRegistry extends Context.Tag("AuthRegistry")<
   AuthRegistry,
-  { readonly lookup: (appId: string) => Option.Option<AuthApp> }
+  {
+    readonly lookup: (appId: string) => Option.Option<AuthApp>;
+    readonly checkReadiness: () => Promise<void>;
+  }
 >() {}
 
 const buildRegistry = Effect.gen(function* () {
@@ -39,12 +43,24 @@ const buildRegistry = Effect.gen(function* () {
 
   const entries = yield* Effect.forEach(apps, (app) =>
     buildAuthOptions(app, env, storage).pipe(
-      Effect.map((options) => [app.id, { app, auth: betterAuth(options) }] as const),
+      Effect.map(({ options, checkDatabase }) =>
+        [app.id, { app, auth: betterAuth(options), checkDatabase }] as const,
+      ),
     ),
   );
 
   const map = new Map<string, AuthApp>(entries);
-  return AuthRegistry.of({ lookup: (appId) => Option.fromNullable(map.get(appId)) });
+  return AuthRegistry.of({
+    lookup: (appId) => Option.fromNullable(map.get(appId)),
+    checkReadiness: async () => {
+      const first = entries[0]?.[1];
+      if (!first) throw new Error("No auth apps configured");
+      await Promise.all([
+        first.checkDatabase(),
+        ...(Option.isSome(storage) ? [storage.value.ping()] : []),
+      ]);
+    },
+  });
 });
 
 const AuthRegistryLive = Layer.scoped(AuthRegistry, buildRegistry);

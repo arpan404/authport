@@ -1,4 +1,6 @@
 apps:
+  # IDs are canonical lowercase letters/digits joined by single hyphens. Startup
+  # rejects any schema, provider, browser-route, or secret-key collision.
   - id: authport-web
     name: Authport Web
     url: http://localhost:3001
@@ -21,7 +23,8 @@ apps:
     #   - providerId: okta
     #     discoveryUrl: https://your-tenant.okta.com/.well-known/openid-configuration
     #     scopes: [openid, email, profile]
-    # Enterprise SSO via SAML. providerId must be globally unique. IdP signing cert
+    # Enterprise SSO via SAML. providerId must be globally unique. Assertions must
+    # match an AuthnRequest, include timestamps, and use current algorithms. IdP cert
     # in env (AUTHPORT_WEB_SAML_ACME_OKTA_IDP_CERT); optional SP key in
     # AUTHPORT_WEB_SAML_ACME_OKTA_SP_PRIVATE_KEY. Give the IdP this ACS URL:
     #   ${BETTER_AUTH_URL}/api/auth/sso/saml2/sp/acs/<providerId>
@@ -30,4 +33,13 @@ apps:
     #     domain: acme.com
     #     issuer: https://acme.okta.com/exk...        # IdP entityID
     #     entryPoint: https://acme.okta.com/app/abc/sso/saml   # IdP SSO URL
-    #     wantAssertionsSigned: true
+    #     # signed assertions + audience restriction are enforced automatically.
+    # Opt in to cross-subdomain cookies ONLY if this app trusts its subdomain
+    # siblings (otherwise cookies stay host-only on the auth origin — no leak):
+    # cookieDomain: ".example.com"
+    # Cross-provider account linking is OFF by default. To let a trusted provider's
+    # verified email link into an existing account (same email only), list it here.
+    # Each entry must be a configured provider on this app (social name / oidc /
+    # saml providerId). Only trust providers that won't assert emails users don't own.
+    # accountLinking:
+    #   trustedProviders: [google]

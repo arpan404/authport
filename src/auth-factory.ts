@@ -6,8 +6,8 @@ import { Config, Effect, Option, Redacted, Scope } from "effect";
 import type { App } from "./apps";
 import { acquirePool, createDb } from "./db";
 import type { EnvValues } from "./env";
-import { ProviderCredentialsError } from "./errors";
-import type { SecondaryStorageApi } from "./redis";
+import { InsecureConfigError, ProviderCredentialsError } from "./errors";
+import { namespaceStorage, type SecondaryStorageApi } from "./redis";
 
 /** One statically-provisioned SSO provider entry for the `sso` plugin. */
 type DefaultSsoProvider = NonNullable<
@@ -15,6 +15,11 @@ type DefaultSsoProvider = NonNullable<
 >[number];
 
 type SocialCredentials = Record<string, { clientId: string; clientSecret: string }>;
+
+export type BuiltAuthOptions = {
+  options: BetterAuthOptions;
+  checkDatabase: () => Promise<void>;
+};
 
 /** Uppercased, env-safe form of an id, e.g. "authport-web" -> "AUTHPORT_WEB". */
 const envToken = (value: string) =>
@@ -107,31 +112,33 @@ const buildSamlProviders = (
       cert: requiredSecret(app.id, provider.providerId, `${base}_IDP_CERT`),
       spPrivateKey: optionalSecret(`${base}_SP_PRIVATE_KEY`),
     }).pipe(
-      Effect.map(
-        ({ cert, spPrivateKey }) =>
-          ({
-            domain: provider.domain,
-            providerId: provider.providerId,
-            samlConfig: {
-              issuer: provider.issuer,
-              entryPoint: provider.entryPoint,
-              cert,
-              callbackUrl: `${authUrl}/api/auth/sso/saml2/sp/acs/${provider.providerId}`,
-              spMetadata: {
-                entityID: `${authUrl}/api/auth/sso/saml2/sp/metadata`,
-                binding: "post",
-              },
-              wantAssertionsSigned: provider.wantAssertionsSigned ?? true,
-              ...(provider.audience ? { audience: provider.audience } : {}),
-              ...(provider.identifierFormat
-                ? { identifierFormat: provider.identifierFormat }
-                : {}),
-              ...(Option.isSome(spPrivateKey)
-                ? { privateKey: spPrivateKey.value }
-                : {}),
-            },
-          }) satisfies DefaultSsoProvider,
-      ),
+      Effect.map(({ cert, spPrivateKey }) => {
+        const spEntityId =
+          `${authUrl}/api/auth/sso/saml2/sp/metadata?providerId=` +
+          encodeURIComponent(provider.providerId);
+        return {
+          domain: provider.domain,
+          providerId: provider.providerId,
+          samlConfig: {
+            issuer: provider.issuer,
+            entryPoint: provider.entryPoint,
+            cert,
+            callbackUrl: `${authUrl}/api/auth/sso/saml2/sp/acs/${provider.providerId}`,
+            spMetadata: { entityID: spEntityId, binding: "post" },
+            // Always require the IdP's assertions to be signed, and always assert
+            // an AudienceRestriction (default: our SP entityID) so an assertion
+            // minted for a different SP cannot be replayed here.
+            wantAssertionsSigned: true,
+            audience: provider.audience ?? spEntityId,
+            ...(provider.identifierFormat
+              ? { identifierFormat: provider.identifierFormat }
+              : {}),
+            ...(Option.isSome(spPrivateKey)
+              ? { privateKey: spPrivateKey.value }
+              : {}),
+          },
+        } satisfies DefaultSsoProvider;
+      }),
     );
   });
 
@@ -145,17 +152,43 @@ export const buildAuthOptions = (
   app: App,
   env: EnvValues,
   storage: Option.Option<SecondaryStorageApi>,
-): Effect.Effect<BetterAuthOptions, ProviderCredentialsError, Scope.Scope> =>
+): Effect.Effect<
+  BuiltAuthOptions,
+  ProviderCredentialsError | InsecureConfigError,
+  Scope.Scope
+> =>
   Effect.gen(function* () {
-    const pool = yield* acquirePool(Redacted.value(env.databaseUrl), app.schema);
+    const pool = yield* acquirePool(
+      Redacted.value(env.databaseUrl),
+      app.schema,
+      env.databasePoolMaxPerApp,
+    );
     const social = yield* buildSocialProviders(app);
     const oidc = yield* buildOidcProviders(app);
     const saml = yield* buildSamlProviders(app, env.authUrl);
 
-    const crossSite = Option.isSome(env.cookieDomain) || env.isProd;
-    const secondaryStorage = Option.getOrUndefined(storage);
+    const cookieDomain = app.cookieDomain;
+    if (cookieDomain) {
+      const authHost = new URL(env.authUrl).hostname.toLowerCase();
+      const domain = cookieDomain.replace(/^\./, "").toLowerCase();
+      if (authHost !== domain && !authHost.endsWith(`.${domain}`)) {
+        yield* Effect.fail(
+          new InsecureConfigError({
+            message: `cookieDomain "${cookieDomain}" is not a parent of the auth host for app "${app.id}"`,
+          }),
+        );
+      }
+    }
+    // SameSite=None is needed for cross-origin app -> auth calls (prod default).
+    const crossSite = cookieDomain !== undefined || env.isProd;
+    const secondaryStorage = Option.getOrUndefined(
+      Option.map(storage, (value) =>
+        namespaceStorage(value, `authport:${app.schema}`),
+      ),
+    );
+    const ipAddressHeaders = Option.getOrUndefined(env.ipAddressHeaders);
 
-    return {
+    const options = {
       appName: env.appName,
       baseURL: env.authUrl,
       basePath: "/api/auth",
@@ -163,6 +196,20 @@ export const buildAuthOptions = (
       database: { db: createDb(pool), type: "postgres" },
       trustedOrigins: app.origins,
       emailAndPassword: { enabled: true },
+      // Cross-provider account linking is OFF unless the app explicitly lists
+      // trusted providers. When enabled, linking still requires a matching email
+      // (`allowDifferentEmails: false`), so a trusted provider can only link to an
+      // account with the same address — never take over an arbitrary one.
+      account: {
+        accountLinking:
+          app.trustedLinkProviders.length > 0
+            ? {
+                enabled: true,
+                trustedProviders: app.trustedLinkProviders,
+                allowDifferentEmails: false,
+              }
+            : { enabled: false },
+      },
       // jwt(): /api/auth/jwks + /api/auth/token for stateless, cross-domain
       //   validation by app backends. bearer(): Authorization: Bearer <token>.
       //   genericOAuth(): enterprise OIDC IdP delegation. sso(): enterprise SAML
@@ -171,7 +218,19 @@ export const buildAuthOptions = (
         jwt(),
         bearer(),
         ...(oidc.length > 0 ? [genericOAuth({ config: oidc })] : []),
-        ...(saml.length > 0 ? [sso({ defaultSSO: saml })] : []),
+        ...(saml.length > 0
+          ? [
+              sso({
+                defaultSSO: saml,
+                saml: {
+                  enableInResponseToValidation: true,
+                  allowIdpInitiated: false,
+                  requireTimestamps: true,
+                  algorithms: { onDeprecated: "reject" },
+                },
+              }),
+            ]
+          : []),
       ],
       ...(Object.keys(social).length
         ? { socialProviders: social as BetterAuthOptions["socialProviders"] }
@@ -186,17 +245,22 @@ export const buildAuthOptions = (
       advanced: {
         // Namespace cookies so multiple apps on the same auth domain don't clash.
         cookiePrefix: app.schema,
-        ...(Option.isSome(env.cookieDomain)
-          ? {
-              crossSubDomainCookies: {
-                enabled: true,
-                domain: env.cookieDomain.value,
-              },
-            }
+        // Resolve the real client IP behind a trusted proxy so rate limits are
+        // per-client instead of a single shared bucket.
+        ...(ipAddressHeaders ? { ipAddress: { ipAddressHeaders } } : {}),
+        // Cross-subdomain cookies are opt-in PER APP. Without it, cookies stay
+        // host-only on the auth origin and never leak to sibling app subdomains.
+        ...(cookieDomain !== undefined
+          ? { crossSubDomainCookies: { enabled: true, domain: cookieDomain } }
           : {}),
         ...(crossSite
           ? { defaultCookieAttributes: { sameSite: "none" as const, secure: true } }
           : {}),
       },
     } satisfies BetterAuthOptions;
+
+    return {
+      options,
+      checkDatabase: () => pool.query("SELECT 1").then(() => undefined),
+    } satisfies BuiltAuthOptions;
   });

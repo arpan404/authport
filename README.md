@@ -15,6 +15,8 @@ bun run dev
 
 The app allowlist lives in `apps.yaml`:
 
+- `id` and provider IDs use canonical lowercase letters, digits, and single hyphens.
+  Startup rejects derived-schema, provider, client routing, and secret-key collisions.
 - `url` is the app's URL.
 - `origins` are browser origins allowed to call this auth service (used for CORS).
 - `clientId` is a **public** identifier a browser app sends via the `x-app-key`
@@ -75,6 +77,8 @@ instance bound to its own Postgres schema (`app_<id>`), so:
   minted for one app is meaningless to another.
 - Cookies are namespaced per app (`cookiePrefix`), so apps served from the same
   auth domain don't clobber each other's sessions.
+- Redis keys are also namespaced per app, so cached sessions, verification records,
+  and rate-limit counters cannot cross tenant boundaries.
 
 `bun run auth:migrate` provisions the schema and Better Auth tables for every app
 in `apps.yaml`. Re-run it after adding an app or upgrading Better Auth.
@@ -129,10 +133,13 @@ apple, microsoft, discord, twitter, linkedin, gitlab, spotify, …).
 
 Two supported paths, both enabled per app:
 
-- **Cross-subdomain cookies** — set `COOKIE_DOMAIN` (e.g. `.example.com`) so
-  `auth.example.com` issues cookies usable by `app.example.com`. Cookies are marked
-  `SameSite=None; Secure` in production (`NODE_ENV=production`) or whenever
-  `COOKIE_DOMAIN` is set.
+- **Cross-subdomain cookies** — opt in **per app** with `cookieDomain` in `apps.yaml`
+  (e.g. `.example.com`) so `auth.example.com` issues cookies usable by
+  `app.example.com`. Only enable it for apps that trust their subdomain siblings —
+  a shared cookie domain sends that app's session cookie to every subdomain under
+  it. Without `cookieDomain`, cookies stay host-only on the auth origin and never
+  reach other apps. Cookies are `SameSite=None; Secure` in production or whenever a
+  `cookieDomain` is set.
 - **Bearer / JWT** — for apps on unrelated domains or non-browser clients. The
   `bearer` plugin accepts `Authorization: Bearer <session-token>`; the `jwt` plugin
   exposes `/api/auth/token` and `/api/auth/jwks` (per app) so an app backend can
@@ -188,8 +195,10 @@ from config (no dynamic registration needed).
            domain: acme.com             # email domain that routes users here
            issuer: https://acme.okta.com/exk...          # IdP entityID
            entryPoint: https://acme.okta.com/app/abc/sso/saml   # IdP SSO URL
-           wantAssertionsSigned: true
    ```
+
+   Signed assertions and an audience restriction (default: AuthPort's SP entityID)
+   are **enforced automatically** — there is no option to disable them.
 
 2. Put the IdP signing certificate (and optional SP private key) in env:
 
@@ -199,8 +208,8 @@ from config (no dynamic registration needed).
    AUTHPORT_WEB_SAML_ACME_OKTA_SP_PRIVATE_KEY="…"
    ```
 
-3. Give the IdP this **ACS (Assertion Consumer Service) URL** (AuthPort's SP
-   metadata is at `${BETTER_AUTH_URL}/api/auth/sso/saml2/sp/metadata`):
+3. Give the IdP this **ACS (Assertion Consumer Service) URL**. Tenant-specific SP
+   metadata is public at `${BETTER_AUTH_URL}/api/auth/sso/saml2/sp/metadata?providerId=<providerId>`:
 
    ```
    ${BETTER_AUTH_URL}/api/auth/sso/saml2/sp/acs/<providerId>
@@ -216,6 +225,10 @@ request that carries no app key or cookie — AuthPort routes it to the right ap
 instance by the providerId in the ACS URL. Run `bun run auth:migrate` after adding
 a SAML app (the plugin adds an `ssoProvider` table per schema).
 
+SAML is strict by default: assertions must be signed, audience-restricted, timestamped,
+use non-deprecated algorithms, and match a recent AuthnRequest. Unsolicited
+IdP-initiated responses are rejected.
+
 ### AuthPort as an identity provider (not enabled)
 
 The inverse — "Sign in with AuthPort" for your apps via the `oidc-provider` plugin —
@@ -225,10 +238,55 @@ cuts against the fully-isolated model. It would apply to one designated app.
 ## Rate limiting
 
 Rate limiting is enabled on every app instance (100 requests / 60s by default).
-Set `REDIS_URL` so counters (and session cache) are shared across server instances;
+Set `REDIS_URL` so app-namespaced counters and session cache are shared across instances;
 without it, storage falls back to per-process memory — fine for a single instance,
-not for a horizontally-scaled deployment. Behind a proxy, configure Better Auth's
-`advanced.ipAddress` so per-IP limits resolve the real client address.
+not for a horizontally-scaled deployment. Behind a proxy, set `IP_ADDRESS_HEADERS`
+(e.g. `x-forwarded-for`) so per-IP limits resolve the real client instead of a
+single shared bucket. Redis increments use one atomic operation, so parallel requests
+cannot pass a stale read of the counter.
+
+## Operations and capacity
+
+- `/health` is a liveness endpoint. `/ready` checks PostgreSQL and Redis with a
+  three-second timeout and returns 503 while dependencies are unavailable.
+- SIGTERM/SIGINT stop new connections, allow up to ten seconds for in-flight requests,
+  then close PostgreSQL, Redis, and the Effect runtime.
+- Each app owns a bounded PostgreSQL pool. Total possible connections are
+  `DATABASE_POOL_MAX_PER_APP × app count × replica count`; size the database and
+  replica count together (or place PgBouncer in front).
+- Bun rejects request bodies above `MAX_REQUEST_BODY_SIZE` before Better Auth parses
+  them. The default is 512 KiB, leaving room for base64/form encoding around the
+  SAML plugin's smaller decoded-response ceiling.
+- HSTS is intentionally owned by the TLS edge, where domain-wide HTTPS readiness is
+  known. Do not enable `includeSubDomains` or preload without reviewing every sibling.
+
+## Security posture
+
+Built-in, on by default:
+
+- **Tenant isolation** — per-app Better Auth instance, Postgres schema, JWKS keys,
+  and cookie prefix. Tokens/sessions never cross apps.
+- **HTTPS enforced in production** — startup fails if `BETTER_AUTH_URL` is not
+  an HTTPS origin, or if `BETTER_AUTH_SECRET` is weak, when `NODE_ENV=production`.
+- **Host-only cookies by default**; cross-subdomain sharing is opt-in per app.
+- **No cross-provider account linking by default** — an external IdP asserting an
+  email cannot take over an existing account. Opt in per app via
+  `accountLinking.trustedProviders` in `apps.yaml` (must name a provider configured
+  on that app); linking then still requires a **matching email**
+  (`allowDifferentEmails: false`), so a trusted provider can only link to an account
+  with the same address.
+- **SAML**: signed, audience-restricted, timestamped assertions using current
+  algorithms; ACS routed by a globally-unique providerId.
+- **Constant-time key comparison**; secret keys may be stored hashed as
+  `sha256:<hex>` in `apps.yaml` so a config leak doesn't expose them.
+- **Security headers** on every response (`X-Content-Type-Options`, `X-Frame-Options`,
+  `Referrer-Policy`, and COOP). HSTS is configured at the TLS edge.
+- **Log hygiene** — raw error causes (possible tokens/PII) are never logged.
+
+Your responsibility (deployment): terminate TLS, keep dependencies patched
+(especially `@better-auth/sso`), set `IP_ADDRESS_HEADERS` + `REDIS_URL` when scaled,
+and rotate `secretKeys`. Note the `x-app-key` gate is multi-tenant **routing + CORS**,
+not app authentication — the security boundary is Better Auth itself.
 
 ## Layout
 

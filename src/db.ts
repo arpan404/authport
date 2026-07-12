@@ -11,12 +11,16 @@ import { Pool } from "pg";
 export const acquirePool = (
   connectionString: string,
   schema?: string,
+  max = 5,
 ): Effect.Effect<Pool, never, Scope.Scope> =>
   Effect.acquireRelease(
     Effect.sync(
       () =>
         new Pool({
           connectionString,
+          max,
+          connectionTimeoutMillis: 5_000,
+          idleTimeoutMillis: 30_000,
           ...(schema ? { options: `-c search_path=${schema}` } : {}),
         }),
     ),
