@@ -1,7 +1,8 @@
 import type { BetterAuthOptions } from "better-auth";
-import { bearer, genericOAuth, jwt } from "better-auth/plugins";
+import { bearer, genericOAuth, jwt, username } from "better-auth/plugins";
 import type { GenericOAuthConfig } from "better-auth/plugins";
 import { sso } from "@better-auth/sso";
+import { passkey } from "@better-auth/passkey";
 import { Config, Effect, Option, Redacted, Scope } from "effect";
 import type { App } from "./apps";
 import { acquirePool, createDb } from "./db";
@@ -21,6 +22,13 @@ export type BuiltAuthOptions = {
   options: BetterAuthOptions;
   checkDatabase: () => Promise<void>;
 };
+
+export const passkeyOptionsFor = (app: App) => ({
+  rpID: new URL(app.url).hostname,
+  rpName: app.name ?? app.id,
+  origin: new URL(app.url).origin,
+  advanced: { webAuthnChallengeCookie: `${app.schema}.passkey_challenge` },
+});
 
 /** Uppercased, env-safe form of an id, e.g. "authport-web" -> "AUTHPORT_WEB". */
 const envToken = (value: string) =>
@@ -242,6 +250,8 @@ export const buildAuthOptions = (
       plugins: [
         jwt(),
         bearer(),
+        username(),
+        passkey(passkeyOptionsFor(app)),
         ...(oidc.length > 0 ? [genericOAuth({ config: oidc })] : []),
         ...(saml.length > 0
           ? [
