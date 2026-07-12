@@ -1,5 +1,14 @@
 import type { BetterAuthOptions } from "better-auth";
-import { bearer, genericOAuth, jwt, username } from "better-auth/plugins";
+import {
+  bearer,
+  emailOTP,
+  genericOAuth,
+  jwt,
+  magicLink,
+  phoneNumber,
+  twoFactor,
+  username,
+} from "better-auth/plugins";
 import type { GenericOAuthConfig } from "better-auth/plugins";
 import { sso } from "@better-auth/sso";
 import { passkey } from "@better-auth/passkey";
@@ -29,6 +38,9 @@ export const passkeyOptionsFor = (app: App) => ({
   origin: new URL(app.url).origin,
   advanced: { webAuthnChallengeCookie: `${app.schema}.passkey_challenge` },
 });
+
+const phonePlaceholderEmail = (app: App, phoneNumber: string) =>
+  `${Bun.CryptoHasher.hash("sha256", phoneNumber, "hex")}@phone.${app.id}.invalid`;
 
 /** Uppercased, env-safe form of an id, e.g. "authport-web" -> "AUTHPORT_WEB". */
 const envToken = (value: string) =>
@@ -252,6 +264,56 @@ export const buildAuthOptions = (
         bearer(),
         username(),
         passkey(passkeyOptionsFor(app)),
+        magicLink({
+          storeToken: "hashed",
+          sendMagicLink: async ({ email, url }) => {
+            notifier.link(email, "Sign in", url);
+          },
+        }),
+        emailOTP({
+          storeOTP: "hashed",
+          allowedAttempts: 3,
+          changeEmail: { enabled: true, verifyCurrentEmail: true },
+          sendVerificationOTP: async ({ email, otp, type }) => {
+            const action = {
+              "sign-in": "Your sign-in code",
+              "email-verification": "Verify your email",
+              "forget-password": "Reset your password",
+              "change-email": "Confirm your email change",
+            }[type];
+            notifier.emailOtp(email, action, otp);
+          },
+        }),
+        phoneNumber({
+          allowedAttempts: 3,
+          requireVerification: true,
+          phoneNumberValidator: (value) => /^\+[1-9]\d{7,14}$/.test(value),
+          sendOTP: async ({ phoneNumber: to, code }) => {
+            notifier.smsOtp(to, "Your verification code", code);
+          },
+          sendPasswordResetOTP: async ({ phoneNumber: to, code }) => {
+            notifier.smsOtp(to, "Reset your password", code);
+          },
+          signUpOnVerification: {
+            getTempEmail: (value) => phonePlaceholderEmail(app, value),
+          },
+        }),
+        twoFactor({
+          issuer: app.name ?? env.appName,
+          allowPasswordless: true,
+          totpOptions: { allowPasswordless: true },
+          backupCodeOptions: {
+            allowPasswordless: true,
+            storeBackupCodes: "encrypted",
+          },
+          otpOptions: {
+            allowedAttempts: 5,
+            storeOTP: "hashed",
+            sendOTP: async ({ user, otp }) => {
+              notifier.emailOtp(user.email, "Your two-factor code", otp);
+            },
+          },
+        }),
         ...(oidc.length > 0 ? [genericOAuth({ config: oidc })] : []),
         ...(saml.length > 0
           ? [
