@@ -210,3 +210,7 @@ src/server.ts        Bun HTTP server and lifecycle
 src/migrate.ts       Per-app additive migrations
 examples/consumer    Minimal browser client
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 Arpan Bhandari
