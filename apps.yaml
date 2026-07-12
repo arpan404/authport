@@ -14,7 +14,7 @@ apps:
       - dev-authport-web-secret-change-me
     # Required with NOTIFICATION_DELIVERY=providers. The domain must be onboarded
     # in Cloudflare Email Service.
-    emailFrom: auth@example.com
+    emailFrom: auth@yourdomain.com
     # Enabled social logins. Credentials come from env, e.g. google ->
     # AUTHPORT_WEB_GOOGLE_CLIENT_ID / AUTHPORT_WEB_GOOGLE_CLIENT_SECRET.
     # socialProviders:

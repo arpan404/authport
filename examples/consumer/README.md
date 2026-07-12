@@ -29,7 +29,10 @@ Open http://localhost:3001 and try the buttons.
 - `signIn.sso({ providerId })` — enterprise SSO to a specific IdP.
 - `signIn.sso({ email })` — enterprise SSO routed by the email's domain.
 - `signIn.social({ provider })` — social login.
+- Client plugins for username, passkey, magic-link, email OTP, phone, and 2FA.
 - `getSession()` / `signOut()`.
 
 To actually complete an SSO login you need the matching provider configured on the
 AuthPort side (`samlProviders`/`socialProviders` in `apps.yaml` + credentials in env).
+Email and SMS methods print their links/codes in local console mode. Production uses
+the configured Cloudflare Email Service and Twilio transports.

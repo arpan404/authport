@@ -4,8 +4,8 @@
 
 Self-hosted, multi-app authentication gateway powered by
 [Better Auth](https://better-auth.com). AuthPort gives every app an isolated user
-pool while running email/password auth, social login, OIDC, and SAML from one Bun
-service.
+pool while running passwords, passkeys, passwordless email/phone, social login,
+OIDC, and SAML from one Bun service.
 
 AuthPort is a thin gateway, not a shared identity provider. Apps share the service,
 but not users, sessions, keys, or database tables.
@@ -13,12 +13,17 @@ but not users, sessions, keys, or database tables.
 ## Features
 
 - Isolated Better Auth instance and PostgreSQL schema per app
-- Email/password, social login, generic OIDC, and SAML SSO
+- Passwords, usernames, passkeys, magic links, email/phone OTP, and 2FA
+- Social login, generic OIDC, and SAML SSO
 - Host-only, app-namespaced cookies by default
 - Per-app JWKS, bearer tokens, and Redis namespaces
 - Config-driven app and provider registration
 - Rate limiting, readiness checks, graceful shutdown, and security headers
 - Strict startup validation for production configuration
+
+Every app supports email verification, link and OTP password recovery, password
+changes, TOTP, email-code 2FA, trusted devices, and encrypted backup codes. See
+[`docs/authentication.md`](docs/authentication.md) for client methods.
 
 ## How it works
 
@@ -82,6 +87,9 @@ apps:
     secretKeys:
       - dev-secret-change-me
 
+    # Required for production email delivery.
+    emailFrom: auth@example.com
+
     socialProviders:
       - google
 
@@ -115,12 +123,29 @@ request:
 
 ```ts
 import { ssoClient } from "@better-auth/sso/client";
+import { passkeyClient } from "@better-auth/passkey/client";
 import { createAuthClient } from "better-auth/client";
-import { genericOAuthClient } from "better-auth/client/plugins";
+import {
+  emailOTPClient,
+  genericOAuthClient,
+  magicLinkClient,
+  phoneNumberClient,
+  twoFactorClient,
+  usernameClient,
+} from "better-auth/client/plugins";
 
 export const authClient = createAuthClient({
   baseURL: "https://auth.example.com",
-  plugins: [ssoClient(), genericOAuthClient()],
+  plugins: [
+    ssoClient(),
+    genericOAuthClient(),
+    usernameClient(),
+    passkeyClient(),
+    magicLinkClient(),
+    emailOTPClient(),
+    phoneNumberClient(),
+    twoFactorClient(),
+  ],
   fetchOptions: {
     credentials: "include",
     headers: { "x-app-key": "authport-web" },
@@ -132,6 +157,8 @@ await authClient.signIn.email({ email, password });
 await authClient.signIn.social({ provider: "google", callbackURL: "/" });
 await authClient.signIn.oauth2({ providerId: "okta", callbackURL: "/" });
 await authClient.signIn.sso({ providerId: "acme-okta", callbackURL: "/" });
+await authClient.signIn.passkey();
+await authClient.signIn.magicLink({ email, callbackURL: "/" });
 ```
 
 See [`examples/consumer`](examples/consumer) for a runnable browser client.
@@ -168,6 +195,22 @@ Each app exposes its own `/api/auth/token` and `/api/auth/jwks` endpoints.
 
 ## Production
 
+### Transactional delivery
+
+Local development defaults to `NOTIFICATION_DELIVERY=console`, which prints links
+and OTPs. Production rejects console delivery and requires Cloudflare Email Service
+and Twilio credentials from `.env.example`.
+
+Onboard every `emailFrom` domain before sending:
+
+```sh
+npx wrangler email sending enable example.com
+```
+
+Use a Twilio API key in production and set `TWILIO_FROM` to a Twilio sender. Run
+`bun run auth:migrate` after enabling these auth methods so every app schema gains
+the passkey, username, phone, and two-factor fields/tables.
+
 Important environment settings are documented in `.env.example`:
 
 | Variable | Purpose |
@@ -179,6 +222,9 @@ Important environment settings are documented in `.env.example`:
 | `MAX_REQUEST_BODY_SIZE` | Bun request body limit, up to 1 MiB |
 | `REDIS_URL` | Shared session cache and atomic rate-limit storage |
 | `IP_ADDRESS_HEADERS` | Trusted proxy headers used to resolve client IPs |
+| `NOTIFICATION_DELIVERY` | `console` locally or `providers` in production |
+| `CLOUDFLARE_*` | Cloudflare account and Email Service API credentials |
+| `TWILIO_*` | Twilio API credentials and SMS sender |
 
 Production mode requires HTTPS and a strong auth secret. Terminate TLS at the edge,
 configure HSTS there, keep Better Auth and the SSO plugin patched, use Redis when
@@ -206,6 +252,7 @@ src/auth-factory.ts  Per-app Better Auth configuration
 src/auth.ts          App registry and Effect layers
 src/db.ts            Scoped PostgreSQL pools
 src/redis.ts         Optional namespaced Redis storage
+src/notifications.ts Cloudflare email and Twilio SMS delivery
 src/server.ts        Bun HTTP server and lifecycle
 src/migrate.ts       Per-app additive migrations
 examples/consumer    Minimal browser client
