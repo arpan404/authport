@@ -42,6 +42,12 @@ export const passkeyOptionsFor = (app: App) => ({
 const phonePlaceholderEmail = (app: App, phoneNumber: string) =>
   `${Bun.CryptoHasher.hash("sha256", phoneNumber, "hex")}@phone.${app.id}.invalid`;
 
+const tenantLink = (app: App, value: string) => {
+  const url = new URL(value);
+  url.searchParams.set("appId", app.id);
+  return url.toString();
+};
+
 /** Uppercased, env-safe form of an id, e.g. "authport-web" -> "AUTHPORT_WEB". */
 const envToken = (value: string) =>
   value.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
@@ -230,14 +236,14 @@ export const buildAuthOptions = (
         requireEmailVerification: true,
         revokeSessionsOnPasswordReset: true,
         sendResetPassword: async ({ user, url }) => {
-          notifier.link(user.email, "Reset your password", url);
+          notifier.link(user.email, "Reset your password", tenantLink(app, url));
         },
       },
       emailVerification: {
         sendOnSignUp: true,
         sendOnSignIn: true,
         sendVerificationEmail: async ({ user, url }) => {
-          notifier.link(user.email, "Verify your email", url);
+          notifier.link(user.email, "Verify your email", tenantLink(app, url));
         },
       },
       user: { changeEmail: { enabled: true } },
@@ -267,7 +273,7 @@ export const buildAuthOptions = (
         magicLink({
           storeToken: "hashed",
           sendMagicLink: async ({ email, url }) => {
-            notifier.link(email, "Sign in", url);
+            notifier.link(email, "Sign in", tenantLink(app, url));
           },
         }),
         emailOTP({

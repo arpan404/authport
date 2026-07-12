@@ -1,6 +1,7 @@
 import { Effect, Layer, ManagedRuntime, Option } from "effect";
 import {
   appForCookies,
+  appForPublicAuthLink,
   appForRequest,
   appForSamlCallback,
   appForSamlMetadata,
@@ -70,6 +71,11 @@ const isProviderCallback = (pathname: string) =>
 const isSamlMetadata = (pathname: string) =>
   pathname === "/api/auth/sso/saml2/sp/metadata";
 
+const isPublicAuthLink = (pathname: string) =>
+  pathname === "/api/auth/verify-email" ||
+  pathname === "/api/auth/magic-link/verify" ||
+  pathname.startsWith("/api/auth/reset-password/");
+
 const resolveAuthApp = (app: App) =>
   Effect.gen(function* () {
     const registry = yield* AuthRegistry;
@@ -86,6 +92,7 @@ const handleProviderCallback = (request: Request, config: AppsConfigValue) =>
   Effect.gen(function* () {
     const app: Option.Option<App> = appForSamlCallback(request, config).pipe(
       Option.orElse(() => appForSamlMetadata(request, config)),
+      Option.orElse(() => appForPublicAuthLink(request, config)),
       Option.orElse(() => appForCookies(request, config)),
     );
     if (Option.isNone(app)) return text("Forbidden", 403);
@@ -139,7 +146,9 @@ const handleRequest = (request: Request) =>
     }
 
     const config = yield* AppsConfig;
-    return yield* (isProviderCallback(url.pathname) || isSamlMetadata(url.pathname))
+    return yield* (isProviderCallback(url.pathname) ||
+    isSamlMetadata(url.pathname) ||
+    isPublicAuthLink(url.pathname))
       ? handleProviderCallback(request, config)
       : handleApiRequest(request, config);
   }).pipe(

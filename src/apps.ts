@@ -268,6 +268,27 @@ export const appForSamlMetadata = (
   );
 };
 
+/** Routes emailed verification/reset links, whose token proves possession but
+ * whose public appId is still needed to select the isolated tenant database. */
+export const appForPublicAuthLink = (
+  request: Request,
+  config: AppsConfig,
+): Option.Option<App> => {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const supported =
+    request.method === "GET" &&
+    (path === "/api/auth/verify-email" ||
+      path === "/api/auth/magic-link/verify" ||
+      path.startsWith("/api/auth/reset-password/"));
+  if (!supported) return Option.none();
+
+  const appId = url.searchParams.get("appId");
+  return appId
+    ? Arr.findFirst(config.apps, (app) => app.id === appId)
+    : Option.none();
+};
+
 /**
  * CORS headers for a request. `None` means "reject" (a browser origin that is not
  * trusted); `Some(empty headers)` means "allow" a non-browser call with no Origin.

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Effect, Option } from "effect";
 import {
   appForRequest,
+  appForPublicAuthLink,
   appForSamlCallback,
   appForSamlMetadata,
   corsHeadersFor,
@@ -222,6 +223,20 @@ apps:
     expect(Option.map(appForSamlMetadata(request, derived), (a) => a.id)).toEqual(
       Option.some("web"),
     );
+  });
+
+  test("routes only supported public auth links by appId", () => {
+    const link = new Request(
+      "http://auth.local/api/auth/magic-link/verify?token=secret&appId=web",
+    );
+    expect(Option.map(appForPublicAuthLink(link, config), (app) => app.id)).toEqual(
+      Option.some("web"),
+    );
+
+    const ordinaryApi = new Request(
+      "http://auth.local/api/auth/get-session?appId=web",
+    );
+    expect(appForPublicAuthLink(ordinaryApi, config)).toEqual(Option.none());
   });
 
   test("rejects SAML providerIds that collide across apps", () => {
